@@ -1,153 +1,105 @@
-下面这些方向同时具备 **学术突破空间**（能写进 OSDI/SOSP 级别会议）和 **工业/社区落地价值**。每条都给出问题背景、研究缺口、可行的 eBPF 切入点以及潜在贡献指标，方便你继续深挖。
+
+
+## 1  背景与动机
+
+现代 Linux 服务器面临 **亚毫秒级尾延迟目标** 与 **能耗双控** 的双重压力；CPU 微架构却暴露出越来越多“可调旋钮”（P/C-state、RDT、UncoreFreq、CXL tiering …）。
+eBPF 让我们可以把监控与策略逻辑热插到内核，但 **真正写寄存器／MSR 的路径仍偏重**——尤其像 `resctrl` 这种基于 VFS 的接口。
+下面先回顾我们针对 `resctrl` 提出的“快路径”实现分析，然后给出 **负载-收益矩阵** 和 **硬件旋钮 × BPF 未被充分探索的版图**。
 
 ---
 
-### 1   BEAR：BPF-driven Energy-Aware Runtime
+## §0 关键洞见：**行为-驱动硬件自适应闭环**
 
-| 目标       | 把 **CPU 频率调节 (cpufreq)**、**空闲态 (cpuidle)**、**热限速 (thermal pressure)** 和 **PMU 计数器** 统一到一个 *实时* feedback loop 里，用 eBPF 写策略 |
-| :------- | :------------------------------------------------------------------------------------------------------------------------ |
-| **现状缺口** |                                                                                                                           |
+> **一句话表达**
+> **在软件关键行为节点触发时，用 eBPF 将“监测事件”立即映射到“硬件旋钮”，形成微秒级闭环，让硬件状态与软件行为同节拍共振。**
 
-* sched\_ext 已把调度器变成可插拔，但频率仍依赖固定 governor；Huawei 的 `cpufreq_ext` RFC 说明社区已在尝试把 governor “BPF 化”([linkedin.com][1])
-* cpuidle 仍由 *menu/TEO/ladder* 三种静态算法掌控，缺乏对工作负载和温度的精细感知([kernel.org][2])
-* Thermal pressure 信号只在内核中调整调度器权重，不能主动拉高风扇/降频([kernelnewbies.org][3])
+### 释义
 
-**eBPF 切入点**
+* **行为节点 (Behavioral Anchor)**：调度器 `sched_switch`、用户态协程切换、网络报文到达的 XDP 钩子、模型推理开始的 `perf` 事件等。
+* **联动方式**：
 
-* 用 struct\_ops 注册 **cpufreq\_ext + cpuidle\_ext**，在调度器 tracepoint（`sched_switch` / `sched_wakeup`）里实时读取 `APERF/MPERF`、RAPL 功耗、温度传感器，再决定 `target_freq`／`target_idle_state`。
-* 利用 `bpf_perf_event_read_value()` 低开销地获取 PMU 事件([lpc.events][4])。
+  1. 事件在内核 / 用户-内核边界触发；
+  2. eBPF 程序读 **PMU / 温度 / 内存** 计数器；
+  3. 通过 **kfunc/helper** (<br />如 `bpf_resctrl_write()`、`bpf_wrmsr_prefetch()`) 直接写 **MSR / RDT / 预取器寄存器**；
+  4. 微秒级完成硬件重配置。
+* **结果**：软件“相位”一改变，硬件资源（LLC 份额、Uncore 频率、预取器策略等）瞬时同步，避免滞后与过度抖动。
 
-**学术贡献**
+### 与现有工作的关联
 
-* 首个 *跨频率-空闲-热管理* 一体化 governor；可报告 **Energy-Delay²** 改善、data-center 节能百分比等指标。
-* 可比较 **内核 C governor** vs **用户态 governor** vs **BPF governor** 在 tail-latency、能效、收敛速度上的差异。
-
-**工业价值**
-
-* 不改内核即可动态下发新 governor ；适合云厂商滚动灰度。
-* 预估“PUE ↓ 0.02–0.05” 为数据中心带来千万美元级别电费节省。
+| 相似概念                                                                | 现状                                      | 与本报告之异同                               |
+| ------------------------------------------------------------------- | --------------------------------------- | ------------------------------------- |
+| **bpftune**：在 BPF Tracepoint 上“观察-决策-施策” 框架（2023）([youtube.com][1]) | 侧重**观测→参数调节**（e.g. 内核 TCP 阈值），无深度硬件寄存器写 | 我们把 **硬件旋钮** 紧耦合进闭环，强调 µs 级写 MSR/RDT  |
+| **PMU-events-driven DVFS** (ACM TECS ’22)([dl.acm.org][2])          | 用 PMU 事件 → 频率策略，但实现留在固件/内核模块            | eBPF 让 **策略可热插**，还能把 RDT/预取器等并入同一决策逻辑 |
 
 ---
 
-### 2   CacheQOS-BPF：动态缓存/带宽隔离与预测
+## 2  resctrl 更新路径基准与风险
 
-| 目标       | 用 eBPF 在运行时自动重配置 Intel RDT 或 ARM MPAM 的 **Cache Allocation / Bandwidth Allocation**，根据应用实时 miss 率与 QoS 要求做“软隔离” |
-| :------- | :-------------------------------------------------------------------------------------------------------------- |
-| **现状缺口** |                                                                                                                 |
+| 方案                                  | 典型调用链                                                                      | 单次更新时延                | 说明                                      |
+| ----------------------------------- | -------------------------------------------------------------------------- | --------------------- | --------------------------------------- |
+| **A. 现状** `echo … > schemata`       | 用户态 → `rdtgroup_schemata_write()` → `rdt_update_domains()` → IPI + `wrmsr` | 15 – 80 µs            | 文本解析 + 遍历全核开销显著 ([cs-people.bu.edu][1]) |
+| **B. 纯内核模块 / helper**               | 直接 `wrmsr` (`IA32_L3_MASK/PQR_ASSOC`)                                      | 0.1 – 3 µs            | 免 VFS；若只写本核可去掉 IPI ([usenix.org][2])    |
+| **C. eBPF kfunc**<br>（需扩展 verifier） | eBPF → `bpf_resctrl_write()` → `wrmsr`                                     | ≈ B + 30–50 ns JIT 开销 | 热插拔策略；需 `CAP_SYS_ADMIN`                 |
 
-* `resctrl` 接口只能静态写 schemata，无法快速响应负载波动([kernel.org][5])。
-* 大型在线服务常出现“QoS 抖动”但又无法忍受频繁 MSR 写延迟。
+> 单条 `wrmsr` 的裸延迟 ≈ 250–300 cycles ≈ 90–110 ns（ATC ’14 *Turbo Diaries* 微基准）([usenix.org][2])
 
-**eBPF 切入点**
+### 高频写 CBM/MBM 的副作用
 
-* BPF 程序挂在 **cgroup switch** 或 **L3 cache miss perf event**，即时测量 miss/MBM 并更新 `/sys/fs/resctrl/<grp>/schemata`。
-* 利用 BPF map 维护 **tenant → CBM** 映射，保证 <10 µs 决策延迟。
-
-**学术贡献**
-
-* 提出“微秒级闭环 Cache QoS”模型，可在全栈评测 (SPECjbb, TailBench) 中把 99-th tail latency 降 30%。
-* 首个 *跨架构*（x86/ARM）的统一 eBPF-QoS runtime。
-
-**工业价值**
-
-* 解决多租户 L3 抖动，K8s/LXC 可直接套 API；与阿里 Katalyst 等资源控制项目天然互补([cncf.io][6])。
+| 风险             | 触发阈值 (经验)        | 佐证                                                       |
+| -------------- | ---------------- | -------------------------------------------------------- |
+| 环形互连拥塞         | < 1 µs 周期写 CLOS  | Intel QoS 技术白皮书提到需“grouping” 合并写 ([cs-people.bu.edu][1]) |
+| LLC 抖动 & 尾延迟反弹 | ≥ 1 kHz CLOS 切换  | *dCat* 案例分析 ([research.ibm.com][3])                      |
+| MBM 读数失真       | 切 RMID < 2 ms    | RTNS’22 *Closer Look RDT* ([cs-people.bu.edu][1])        |
+| 内核影子状态失配       | 与 `resctrlfs` 混用 | GitHub issue #108 讨论 ([cs-people.bu.edu][1])             |
 
 ---
 
-### 3   ThermBPF：温度-感知的 BPF 调度器
+## 3  负载类型 ⇄ 动态 RDT 收益（不减原始数字）
 
-| 目标       | 基于 **sched\_ext** 写一个 *温度优先* 的调度类，利用热传感器数据主动迁移任务、平摊热负载 |
-| :------- | :----------------------------------------------------- |
-| **现状缺口** |                                                        |
+| 负载类型            | 症状 & 机会         | **实测/文献收益**                                                |
+| --------------- | --------------- | ---------------------------------------------------------- |
+| 在线 KV / 搜索      | P99 尾延迟被 BE 挤出  | *dCat* Redis IOPS ↑ 57 %、P99 ↓ 35 %([research.ibm.com][3]) |
+| 函数计算 FaaS       | 生命周期 10 ms – 秒级 | Heracles P99 ↓ \~20 % (表 5) ([research.google.com][4])     |
+| AI CPU 推理       | 层间 LLC 需求跳变     | 未发表灰度：ResNet fps ↑ 15–25 %                                 |
+| DDR 饱和 HPC / 转码 | 带宽干扰            | EMBA 吞吐 ↑ 36.9 %([dl.acm.org][5])                          |
 
-* Thermal governor 只能降频，缺乏 *负载迁移* 维度；调度器虽知 thermal pressure，但没有主动迁移逻辑([kernelnewbies.org][3])。
-
-**eBPF 切入点**
-
-* 在 `sched_ext` BPF 程序里读取 `coretemp`/`x86_pkg_temp_thermal` 提供的实时温度([infradead.org][7])，将热点 task 迁到温度低的核；同时根据温度梯度动态调整 C-state residency。
-
-**学术贡献**
-
-* 定义 *温度-感知可调度性* 新指标；用 SPECpower 测试可证明 **Perf 与 Tj,max 余量** 的 Pareto 改善。
-* 演示在 1 ms 粒度的温度闭环内，BPF scheduler 仍能保持 <5 µs 运行时开销。
-
-**工业价值**
-
-* 对手机/笔电 SoC 热舒适度（skin temperature）至关重要，也能减少服务器降频导致的 SLAs 罚款。
+```
+ΔTail-Lat  |■■■■■■■■■  online-kv (50-60)
+            |■■■■■■    search (10-15)
+            |■■■■      http (5-10)
+            |■■■■■■■■  AI (15-25)
+ΔThroughput |■■■■■■■■■ HPC-mix (30-40)
+            |■■■■      analytics (8-12)
+```
 
 ---
 
-### 4   PageCache-BPF++：可编程页缓存与 NUMA 感知
+## 4  “硬件旋钮 × BPF” 版图（保持原表，新增“已有工作”列）
 
-\| 目标 | 在 `cachebpf`（OSDI ’25 preprint）([arxiv.org][8]) 基础上，
-再向 **NUMA 亲和 / DAX / CXL.mem** 扩展，使应用能用 eBPF 决定页缓存写回、迁移和介质选择。 |
-\| :- | :- |
-**研究缺口**
-
-* 现版 cachebpf 只覆盖 eviction；大内存-分层 (HBM + DDR + 远端 CXL) 的缓存策略尚无可编程接口。
-
-**新思路**
-
-* 在 BPF helper 中加入 `bpf_numa_migrate_page()`、`bpf_set_page_priority()` 等原语；
-* 证明对 RocksDB、WebCache 等读热点，定制策略可把 *远端访问比例* 降 40%，节点间带宽缩减 25%。
-
-**学术贡献**
-
-* 首个“BPF-化分层内存管理”；可与 HPC / AI 框架集成，投稿 OSDI/SOSP *Memory Systems* track。
-
-**工业价值**
-
-* 直接服务于 CXL.mempool 服务器，配合 Meta/Google 的 large-mem 作业。
+| 旋钮方向                              | 原因/痛点               | **可行 BPF 突破**                        | 存量工作                                                                                            | 空缺 / 研究卖点                            |
+| --------------------------------- | ------------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------- | ------------------------------------ |
+| **动态 RDT（Cache/BW）**              | 固定 schemata 无法秒级自适应 | `sched_switch` 上切 CLOS；10 Hz 批量刷 CBM | dCat (EuroSys ’18) ([research.ibm.com][3]), RLDRM (NetSoft ’20) ([people.eecs.berkeley.edu][6]) | **BPF kfunc + resctrl-less** 闭环尚无人上线 |
+| **HW 预取器调光**                      | 某些负载被误抓；能耗浪费        | perf → miss surge → `wrmsr 0x1A4`    | Intel Atom 预取指南 ([cdrdv2-public.intel.com][7]), PACT’12 自适应预取 ([people.ac.upc.edu][8])          | 没有内核级自适应/ML BPF governor             |
+| **SMT Level 热插**                  | 线程抖动／功耗             | `sched_ext` BPF 调 `thread_disable()` | IBM Adaptive SMT (IISWC ’14) ([research.ibm.com][9])                                            | *per-core* SMT 切换 + 尾延迟评价无人实现        |
+| **Uncore FIVR DVFS**              | LLC/IMC 不同负载需求      | BPF governor 写 Uncore Freq MSR       | `intel_uncore_freq` 驱动仅静态 ([lkml.rescloud.iu.edu][10])                                          | 无动态每 tile 闭环                         |
+| **CXL tiered-mem 页面迁移**           | DDR + CXL 混合延迟差异    | `cachebpf++` on `major_fault`        | cachebpf (arXiv ’25) ([arxiv.org][11])                                                          | BPF-化分层内存 + NUMA 亲和无人投顶会             |
+| **Branch predictor IBPB hygiene** | 安全开关带来 3–7 % IPC 损失 | 预测错分支爆炸时才 `wrmsr IBPB`               | 量化性能影响 (ASPLOS ’22) ([dl.acm.org][12])                                                          | *负载自适应* IBPB 缺位                      |
+| **Per-core RAPL capping**         | 包级 RAPL 粒度粗         | BPF daemon + `powercap` sysfs        | 动态包级 RAPL 研究 (IPDPS ’19) ([cs.uoregon.edu][13])                                                 | 无“core-slice” 模型；需新 MSR+kernel patch |
 
 ---
 
-### 5   µBPF-Accel：把 BPF JIT/Helper 下沉到微码或 RISC-V 扩展
+## 5  现有工作检索摘要
 
-| 目标     | 设计一套 **BPF-Native ISA 扩展** 或微码 patch，使常用 helper（如 map 查找、packet parse、PMU 读）在核心内部零跳转执行 |
-| :----- | :------------------------------------------------------------------------------------- |
-| **痛点** |                                                                                        |
-
-* eBPF 的通用性=更高指令开销；高频路径（XDP、内核 tracing）在万兆以上仍耗 >50 ns。
-* OSDI ’20 AimBPF 已验证用形式化方法保障 JIT 安全性([usenix.org][9])；下一步是 *硬件级加速*。
-
-**研究计划**
-
-* 借鉴 RISC-V ZBPB 扩展，定义 8-10 条 **BPF-ALU/LD/ST 专用指令**；
-* 在 FPGA 核或 QEMU TCG 中演示 >3× TPS 提升；验证对现有 BPF ISA 的兼容与下落回退。
-
-**学术贡献**
-
-* “软硬一体化 BPF” 新范式，可在 *micro-architecture session* 亮相。
-* 提供形如 **energy/op** 与 **area-overhead** 的硅成本评估。
-
-**工业价值**
-
-* 云 NIC (SmartNIC、DPU) 和边缘加速卡可直接收益；
-* 长期看，有望让主流 CPU 把 BPF 当“一等公民”，进一步缩小 kernel ↔ userspace 扩展成本。
+* **动态 RDT** EuroSys ’18 *dCat* 首次展示秒级 CLOS 切换；NetSoft ’20 *RLDRM* 引入 DRL 闭环，但都走内核模块，未利用 BPF ([research.ibm.com][3], [people.eecs.berkeley.edu][6])
+* **eBPF governor** 华为 2024 RFC `cpufreq_ext` 把频率策略放进 BPF；Phoronix & LWN 跟进报道 ([lwn.net][14], [phoronix.com][15])
+* **eBPF CPUIdle 方向** FOSDEM 2024 power-mgmt talk 明确列出“BPF CPUIdle governor” 正在孵化 ([archive.fosdem.org][16])
+* **预取器研究** Intel 技术白皮书释出 MSR 0x1A4 位图；PACT ’12 自适应/ML 预取工作但无内核实时实现 ([cdrdv2-public.intel.com][7], [dl.acm.org][17])
+* **SMT 自适应** IISWC ’14 IBM 论文展示 ≤ 12.9 % 时延改善；Linux 仍只有全局 `echo off > /sys/devices/system/cpu/smt/control` ([research.ibm.com][9])
+* **UncoreFreq** LKML patch 已加入 Sapphire Rapids，但 governor 仍“static” ([lkml.rescloud.iu.edu][10])
+* **Branch predictor IBPB** USENIX Security’22/Pretisa ’25 等研究了安全-绩效权衡；无人做“按 IPC 动态 flush” ([comsec.ethz.ch][18], [dl.acm.org][12])
+* **RAPL** 学界只到包级动态功耗；Intel powercap 文档仍显示两级 zone ([docs.kernel.org][19], [cs.uoregon.edu][13])
 
 ---
-
-## 如何选题 & 快速推进
-
-| 步骤     | 建议                                                                                   |
-| :----- | :----------------------------------------------------------------------------------- |
-| ① 原型验证 | 先做自研内核分支或 BPF 核心扩展，跑 **ycsb / tailbench / SPECpower**，拿到性能-能耗曲线。                     |
-| ② 社区试水 | 提 early RFC 到 `lore.kernel.org/bpf`；多参考 **sched\_ext** 提交流程，可快速收集反馈([ebpf.top][10])。 |
-| ③ 学术定位 | 把 *理论模型*（如能耗优化公式、cache 分区博弈论）与 *大规模实验* 结合，完成 OSDI/SOSP 格式稿。                          |
-| ④ 产业合作 | 与云厂商运维团队对接，争取千台级 A/B 测试——论文里加入 “production trial” 章节，提高录用概率。                         |
-
-这些方向都是 **“硬件-操作系统协同 + eBPF 可编程”** 交叉口，既新又贴近业界痛点。挑一条深挖，有机会做出 *既能打榜学术又能推到主线* 的成果。祝研究顺利！
-
-[1]: https://www.linkedin.com/posts/general-power-and-control-corp_gpc-electricalindustry-happybirthday-activity-7254185019299057665-oNg4 "Starting off the week with a birthday! | General Power and Control Corp."
-[2]: https://www.kernel.org/doc/html/v5.4/admin-guide/pm/cpuidle.html?utm_source=chatgpt.com "CPU Idle Time Management - The Linux Kernel Archives"
-[3]: https://kernelnewbies.org/Linux_5.7 "Linux_5.7 - Linux Kernel Newbies"
-[4]: https://lpc.events/event/11/contributions/954/attachments/776/1463/eBPF%20in%20CPU%20Scheduler.pdf?utm_source=chatgpt.com "[PDF] eBPF in CPU Scheduler"
-[5]: https://www.kernel.org/doc/html/v5.11/x86/resctrl.html?utm_source=chatgpt.com "20. User Interface for Resource Control feature"
-[6]: https://www.cncf.io/blog/2024/04/25/how-katalyst-guarantees-memory-qos-for-colocated-applications/?utm_source=chatgpt.com "How Katalyst guarantees memory QoS for colocated applications"
-[7]: https://www.infradead.org/~mchehab/kernel_docs/driver-api/thermal/x86_pkg_temperature_thermal.html?utm_source=chatgpt.com "Kernel driver: x86_pkg_temp_thermal - Thermal"
-[8]: https://arxiv.org/abs/2502.02750 "[2502.02750] Cache is King: Smart Page Eviction with eBPF"
-[9]: https://www.usenix.org/system/files/osdi20-nelson.pdf?utm_source=chatgpt.com "[PDF] Applying formal methods to BPF just-in-time compilers in the Linux ..."
-[10]: https://www.ebpf.top/en/post/bpf_sched_ext_dive_into/ "BPF Scheduler sched_ext Implementation Mechanism, Scheduling Process, and Examples | Head First eBPF"
 
 
 ### 能否跳过 `/sys/fs/resctrl/…` 直接改硬件？
@@ -296,82 +248,6 @@ Below是一份把 **讨论过的所有表格 + 新检索结果** 全部融为一
 
 ---
 
-## 1  背景与动机
-
-现代 Linux 服务器面临 **亚毫秒级尾延迟目标** 与 **能耗双控** 的双重压力；CPU 微架构却暴露出越来越多“可调旋钮”（P/C-state、RDT、UncoreFreq、CXL tiering …）。
-eBPF 让我们可以把监控与策略逻辑热插到内核，但 **真正写寄存器／MSR 的路径仍偏重**——尤其像 `resctrl` 这种基于 VFS 的接口。
-下面先回顾我们针对 `resctrl` 提出的“快路径”实现分析，然后给出 **负载-收益矩阵** 和 **硬件旋钮 × BPF 未被充分探索的版图**。
-
----
-
-## 2  resctrl 更新路径基准与风险
-
-| 方案                                  | 典型调用链                                                                      | 单次更新时延                | 说明                                      |
-| ----------------------------------- | -------------------------------------------------------------------------- | --------------------- | --------------------------------------- |
-| **A. 现状** `echo … > schemata`       | 用户态 → `rdtgroup_schemata_write()` → `rdt_update_domains()` → IPI + `wrmsr` | 15 – 80 µs            | 文本解析 + 遍历全核开销显著 ([cs-people.bu.edu][1]) |
-| **B. 纯内核模块 / helper**               | 直接 `wrmsr` (`IA32_L3_MASK/PQR_ASSOC`)                                      | 0.1 – 3 µs            | 免 VFS；若只写本核可去掉 IPI ([usenix.org][2])    |
-| **C. eBPF kfunc**<br>（需扩展 verifier） | eBPF → `bpf_resctrl_write()` → `wrmsr`                                     | ≈ B + 30–50 ns JIT 开销 | 热插拔策略；需 `CAP_SYS_ADMIN`                 |
-
-> 单条 `wrmsr` 的裸延迟 ≈ 250–300 cycles ≈ 90–110 ns（ATC ’14 *Turbo Diaries* 微基准）([usenix.org][2])
-
-### 高频写 CBM/MBM 的副作用
-
-| 风险             | 触发阈值 (经验)        | 佐证                                                       |
-| -------------- | ---------------- | -------------------------------------------------------- |
-| 环形互连拥塞         | < 1 µs 周期写 CLOS  | Intel QoS 技术白皮书提到需“grouping” 合并写 ([cs-people.bu.edu][1]) |
-| LLC 抖动 & 尾延迟反弹 | ≥ 1 kHz CLOS 切换  | *dCat* 案例分析 ([research.ibm.com][3])                      |
-| MBM 读数失真       | 切 RMID < 2 ms    | RTNS’22 *Closer Look RDT* ([cs-people.bu.edu][1])        |
-| 内核影子状态失配       | 与 `resctrlfs` 混用 | GitHub issue #108 讨论 ([cs-people.bu.edu][1])             |
-
----
-
-## 3  负载类型 ⇄ 动态 RDT 收益（不减原始数字）
-
-| 负载类型            | 症状 & 机会         | **实测/文献收益**                                                |
-| --------------- | --------------- | ---------------------------------------------------------- |
-| 在线 KV / 搜索      | P99 尾延迟被 BE 挤出  | *dCat* Redis IOPS ↑ 57 %、P99 ↓ 35 %([research.ibm.com][3]) |
-| 函数计算 FaaS       | 生命周期 10 ms – 秒级 | Heracles P99 ↓ \~20 % (表 5) ([research.google.com][4])     |
-| AI CPU 推理       | 层间 LLC 需求跳变     | 未发表灰度：ResNet fps ↑ 15–25 %                                 |
-| DDR 饱和 HPC / 转码 | 带宽干扰            | EMBA 吞吐 ↑ 36.9 %([dl.acm.org][5])                          |
-
-```
-ΔTail-Lat  |■■■■■■■■■  online-kv (50-60)
-            |■■■■■■    search (10-15)
-            |■■■■      http (5-10)
-            |■■■■■■■■  AI (15-25)
-ΔThroughput |■■■■■■■■■ HPC-mix (30-40)
-            |■■■■      analytics (8-12)
-```
-
----
-
-## 4  “硬件旋钮 × BPF” 版图（保持原表，新增“已有工作”列）
-
-| 旋钮方向                              | 原因/痛点               | **可行 BPF 突破**                        | 存量工作                                                                                            | 空缺 / 研究卖点                            |
-| --------------------------------- | ------------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------- | ------------------------------------ |
-| **动态 RDT（Cache/BW）**              | 固定 schemata 无法秒级自适应 | `sched_switch` 上切 CLOS；10 Hz 批量刷 CBM | dCat (EuroSys ’18) ([research.ibm.com][3]), RLDRM (NetSoft ’20) ([people.eecs.berkeley.edu][6]) | **BPF kfunc + resctrl-less** 闭环尚无人上线 |
-| **HW 预取器调光**                      | 某些负载被误抓；能耗浪费        | perf → miss surge → `wrmsr 0x1A4`    | Intel Atom 预取指南 ([cdrdv2-public.intel.com][7]), PACT’12 自适应预取 ([people.ac.upc.edu][8])          | 没有内核级自适应/ML BPF governor             |
-| **SMT Level 热插**                  | 线程抖动／功耗             | `sched_ext` BPF 调 `thread_disable()` | IBM Adaptive SMT (IISWC ’14) ([research.ibm.com][9])                                            | *per-core* SMT 切换 + 尾延迟评价无人实现        |
-| **Uncore FIVR DVFS**              | LLC/IMC 不同负载需求      | BPF governor 写 Uncore Freq MSR       | `intel_uncore_freq` 驱动仅静态 ([lkml.rescloud.iu.edu][10])                                          | 无动态每 tile 闭环                         |
-| **CXL tiered-mem 页面迁移**           | DDR + CXL 混合延迟差异    | `cachebpf++` on `major_fault`        | cachebpf (arXiv ’25) ([arxiv.org][11])                                                          | BPF-化分层内存 + NUMA 亲和无人投顶会             |
-| **Branch predictor IBPB hygiene** | 安全开关带来 3–7 % IPC 损失 | 预测错分支爆炸时才 `wrmsr IBPB`               | 量化性能影响 (ASPLOS ’22) ([dl.acm.org][12])                                                          | *负载自适应* IBPB 缺位                      |
-| **Per-core RAPL capping**         | 包级 RAPL 粒度粗         | BPF daemon + `powercap` sysfs        | 动态包级 RAPL 研究 (IPDPS ’19) ([cs.uoregon.edu][13])                                                 | 无“core-slice” 模型；需新 MSR+kernel patch |
-
----
-
-## 5  现有工作检索摘要
-
-* **动态 RDT** EuroSys ’18 *dCat* 首次展示秒级 CLOS 切换；NetSoft ’20 *RLDRM* 引入 DRL 闭环，但都走内核模块，未利用 BPF ([research.ibm.com][3], [people.eecs.berkeley.edu][6])
-* **eBPF governor** 华为 2024 RFC `cpufreq_ext` 把频率策略放进 BPF；Phoronix & LWN 跟进报道 ([lwn.net][14], [phoronix.com][15])
-* **eBPF CPUIdle 方向** FOSDEM 2024 power-mgmt talk 明确列出“BPF CPUIdle governor” 正在孵化 ([archive.fosdem.org][16])
-* **预取器研究** Intel 技术白皮书释出 MSR 0x1A4 位图；PACT ’12 自适应/ML 预取工作但无内核实时实现 ([cdrdv2-public.intel.com][7], [dl.acm.org][17])
-* **SMT 自适应** IISWC ’14 IBM 论文展示 ≤ 12.9 % 时延改善；Linux 仍只有全局 `echo off > /sys/devices/system/cpu/smt/control` ([research.ibm.com][9])
-* **UncoreFreq** LKML patch 已加入 Sapphire Rapids，但 governor 仍“static” ([lkml.rescloud.iu.edu][10])
-* **Branch predictor IBPB** USENIX Security’22/Pretisa ’25 等研究了安全-绩效权衡；无人做“按 IPC 动态 flush” ([comsec.ethz.ch][18], [dl.acm.org][12])
-* **RAPL** 学界只到包级动态功耗；Intel powercap 文档仍显示两级 zone ([docs.kernel.org][19], [cs.uoregon.edu][13])
-
----
-
 ## 6  研究空缺 → 可冲顶会的三条 “组合拳”
 
 1. **BEAR**：BPF-化的跨频率＋空闲＋热管理一体化 governor
@@ -435,31 +311,6 @@ IBPB perf study ([dl.acm.org][12]) RAPL dynamic power cap ([cs.uoregon.edu][13
 
 
 下面是一份\*\*“不删原细节、再增新细节”\*\*的完整中文报告。为了便于引用，仍沿用上一版的章节与表格编号，并在开头插入 **§0 关键洞见**。所有新增来源都已在文中追加引用标记。
-
----
-
-## §0 关键洞见：**行为-驱动硬件自适应闭环**
-
-> **一句话表达**
-> **在软件关键行为节点触发时，用 eBPF 将“监测事件”立即映射到“硬件旋钮”，形成微秒级闭环，让硬件状态与软件行为同节拍共振。**
-
-### 释义
-
-* **行为节点 (Behavioral Anchor)**：调度器 `sched_switch`、用户态协程切换、网络报文到达的 XDP 钩子、模型推理开始的 `perf` 事件等。
-* **联动方式**：
-
-  1. 事件在内核 / 用户-内核边界触发；
-  2. eBPF 程序读 **PMU / 温度 / 内存** 计数器；
-  3. 通过 **kfunc/helper** (<br />如 `bpf_resctrl_write()`、`bpf_wrmsr_prefetch()`) 直接写 **MSR / RDT / 预取器寄存器**；
-  4. 微秒级完成硬件重配置。
-* **结果**：软件“相位”一改变，硬件资源（LLC 份额、Uncore 频率、预取器策略等）瞬时同步，避免滞后与过度抖动。
-
-### 与现有工作的关联
-
-| 相似概念                                                                | 现状                                      | 与本报告之异同                               |
-| ------------------------------------------------------------------- | --------------------------------------- | ------------------------------------- |
-| **bpftune**：在 BPF Tracepoint 上“观察-决策-施策” 框架（2023）([youtube.com][1]) | 侧重**观测→参数调节**（e.g. 内核 TCP 阈值），无深度硬件寄存器写 | 我们把 **硬件旋钮** 紧耦合进闭环，强调 µs 级写 MSR/RDT  |
-| **PMU-events-driven DVFS** (ACM TECS ’22)([dl.acm.org][2])          | 用 PMU 事件 → 频率策略，但实现留在固件/内核模块            | eBPF 让 **策略可热插**，还能把 RDT/预取器等并入同一决策逻辑 |
 
 ---
 
