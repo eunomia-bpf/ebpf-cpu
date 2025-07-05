@@ -1,0 +1,21 @@
+# Build products
+cpu_freq_control
+cpu_freq_benchmark
+cpu_cstate_control
+cpu_cstate_benchmark
+thermal_cap_control
+thermal_cap_benchmark
+gpu_devfreq_control
+gpu_devfreq_benchmark
+
+# Object files
+*.o
+*.obj
+
+# Temporary files
+*.tmp
+*~
+.*.swp
+
+# Benchmark output files
+*/benchmark_results.txt
