@@ -29,6 +29,7 @@
 #define MSR_IA32_PQR_ASSOC          0xC8F
 #define MSR_IA32_QM_EVTSEL          0xC8D
 #define MSR_IA32_QM_CTR             0xC8E
+#define MSR_IA32_MBA_THRTL_MSR      0xD50
 
 // Prefetch control MSRs
 #define MSR_MISC_FEATURE_CONTROL    0x1A4

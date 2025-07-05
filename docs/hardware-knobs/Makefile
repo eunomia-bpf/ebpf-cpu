@@ -26,8 +26,8 @@ PREFETCH_COMMON_SRCS = $(PREFETCH_DIR)/prefetch_common.c
 PREFETCH_COMMON_OBJS = $(patsubst %.c,$(BUILD_DIR)/%.o,$(PREFETCH_COMMON_SRCS))
 
 # Test programs
-RDT_PROGS = $(BUILD_DIR)/rdt_test $(BUILD_DIR)/rdt_monitor
-PREFETCH_PROGS = $(BUILD_DIR)/prefetch_test $(BUILD_DIR)/prefetch_bench
+RDT_PROGS = $(BUILD_DIR)/rdt_test $(BUILD_DIR)/rdt_monitor $(BUILD_DIR)/rdt_bench
+PREFETCH_PROGS = $(BUILD_DIR)/prefetch_bench
 SMT_PROGS = $(BUILD_DIR)/smt_test $(BUILD_DIR)/smt_bench
 UNCORE_PROGS = $(BUILD_DIR)/uncore_test
 RAPL_PROGS = $(BUILD_DIR)/rapl_test
@@ -58,6 +58,10 @@ $(BUILD_DIR)/$(COMMON_DIR)/%.o: $(COMMON_DIR)/%.c
 $(BUILD_DIR)/$(PREFETCH_DIR)/%.o: $(PREFETCH_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# SMT common object files
+$(BUILD_DIR)/$(SMT_DIR)/%.o: $(SMT_DIR)/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # RDT programs
 $(BUILD_DIR)/rdt_test: $(RDT_DIR)/rdt_test.c $(COMMON_OBJS)
 	$(CC) $(CFLAGS) $< $(COMMON_OBJS) -o $@ $(LDFLAGS)
@@ -65,19 +69,23 @@ $(BUILD_DIR)/rdt_test: $(RDT_DIR)/rdt_test.c $(COMMON_OBJS)
 $(BUILD_DIR)/rdt_monitor: $(RDT_DIR)/rdt_monitor.c $(COMMON_OBJS)
 	$(CC) $(CFLAGS) $< $(COMMON_OBJS) -o $@ $(LDFLAGS)
 
-# Prefetch programs
-$(BUILD_DIR)/prefetch_test: $(PREFETCH_DIR)/prefetch_test.c $(COMMON_OBJS) $(PREFETCH_COMMON_OBJS)
-	$(CC) $(CFLAGS) $< $(COMMON_OBJS) $(PREFETCH_COMMON_OBJS) -o $@ $(LDFLAGS)
+$(BUILD_DIR)/rdt_bench: $(RDT_DIR)/rdt_bench.c $(COMMON_OBJS)
+	$(CC) $(CFLAGS) $< $(COMMON_OBJS) -o $@ $(LDFLAGS)
 
+# Prefetch programs
 $(BUILD_DIR)/prefetch_bench: $(PREFETCH_DIR)/prefetch_bench.c $(COMMON_OBJS) $(PREFETCH_COMMON_OBJS)
 	$(CC) $(CFLAGS) $< $(COMMON_OBJS) $(PREFETCH_COMMON_OBJS) -o $@ $(LDFLAGS)
 
-# SMT programs
-$(BUILD_DIR)/smt_test: $(SMT_DIR)/smt_test.c $(COMMON_OBJS)
-	$(CC) $(CFLAGS) $< $(COMMON_OBJS) -o $@ $(LDFLAGS)
+# SMT common files
+SMT_COMMON_SRCS = $(SMT_DIR)/smt_common.c
+SMT_COMMON_OBJS = $(patsubst %.c,$(BUILD_DIR)/%.o,$(SMT_COMMON_SRCS))
 
-$(BUILD_DIR)/smt_bench: $(SMT_DIR)/smt_bench.c $(COMMON_OBJS)
-	$(CC) $(CFLAGS) $< $(COMMON_OBJS) -o $@ $(LDFLAGS)
+# SMT programs
+$(BUILD_DIR)/smt_test: $(SMT_DIR)/smt_test.c $(COMMON_OBJS) $(SMT_COMMON_OBJS)
+	$(CC) $(CFLAGS) $< $(COMMON_OBJS) $(SMT_COMMON_OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/smt_bench: $(SMT_DIR)/smt_bench.c $(COMMON_OBJS) $(SMT_COMMON_OBJS)
+	$(CC) $(CFLAGS) $< $(COMMON_OBJS) $(SMT_COMMON_OBJS) -o $@ $(LDFLAGS)
 
 # Uncore programs
 $(BUILD_DIR)/uncore_test: $(UNCORE_DIR)/uncore_test.c $(COMMON_OBJS)
@@ -101,7 +109,7 @@ rapl: $(BUILD_DIR) $(RAPL_PROGS)
 cxl: $(BUILD_DIR) $(CXL_PROGS)
 
 # Test targets
-.PHONY: test test-rdt test-prefetch test-smt test-uncore test-rapl test-cxl
+.PHONY: test test-rdt test-prefetch test-smt test-uncore test-rapl test-cxl bench-rdt
 test: test-rdt test-prefetch test-smt test-uncore test-rapl test-cxl
 
 test-rdt: $(RDT_PROGS)
@@ -119,6 +127,9 @@ test-rdt: $(RDT_PROGS)
 	$(BUILD_DIR)/rdt_test
 	@echo "Starting RDT monitor for 5 seconds..."
 	timeout 5 $(BUILD_DIR)/rdt_monitor 5 || true
+	@echo "Running RDT comprehensive benchmark..."
+	@echo "Note: This benchmark requires significant time and resources"
+	@echo "Use 'sudo ./build/rdt_bench [config_index]' to run specific configurations"
 
 test-prefetch: $(PREFETCH_PROGS)
 	@echo "=== Running Prefetch Tests ==="
@@ -176,6 +187,37 @@ test-cxl: $(CXL_PROGS)
 		exit 1; \
 	fi
 	$(BUILD_DIR)/cxl_test
+
+bench-rdt: $(RDT_PROGS)
+	@echo "=== Running RDT Comprehensive Benchmark ==="
+	@echo "Checking for root privileges and MSR support..."
+	@if [ "$$(id -u)" -ne 0 ]; then \
+		echo "ERROR: Root privileges required for MSR access"; \
+		echo "Please run: sudo make bench-rdt"; \
+		exit 1; \
+	fi
+	@if [ ! -c /dev/cpu/0/msr ]; then \
+		echo "Loading MSR module..."; \
+		modprobe msr || (echo "ERROR: Failed to load MSR module" && exit 1); \
+	fi
+	@echo "Running comprehensive RDT benchmark suite..."
+	@echo "This will take several minutes to complete..."
+	@echo "Available configurations:"
+	@echo "  0: Baseline - No RDT Control"
+	@echo "  1: Cache Isolation - High Priority"
+	@echo "  2: Cache Isolation - Low Priority"
+	@echo "  3: Memory Bandwidth Throttling - 50%"
+	@echo "  4: Memory Bandwidth Throttling - 25%"
+	@echo "  5: Mixed Workload - Balanced"
+	@echo "  6: Pointer Chase - Cache Sensitive"
+	@echo "  7: Stream Copy - Bandwidth Sensitive"
+	@echo ""
+	@echo "To run specific configuration: sudo ./build/rdt_bench [0-7]"
+	@echo "To run all configurations: sudo ./build/rdt_bench"
+	@echo ""
+	@echo "Press Ctrl+C to cancel, or any key to continue..."
+	@read -n 1 -r
+	$(BUILD_DIR)/rdt_bench
 
 # System information
 .PHONY: sysinfo
